@@ -14,7 +14,9 @@ from rx.scheduler.eventloop import AsyncIOScheduler
 import effects
 
 initial_state = {
-    "plusone_counter": 0,
+    "counters": {
+        "plusone": 0,
+    },
 }
 
 loop = asyncio.get_event_loop()
@@ -107,11 +109,11 @@ def bind():
         api.respond,
     )
 
-    plusone_counter_lens = lens.GetItem("plusone_counter")
+    plusone_counter_lens = lens.GetItem("counters").GetItem("plusone")
     counter_values = state.changes.pipe(
         op.filter(effects.select(plusone_counter_lens)),
         op.map(effects.focus),
-        op.start_with(initial_state["plusone_counter"]),
+        op.start_with(0),
     )
     api.requests.pipe(
         api.select(GetCounter),

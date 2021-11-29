@@ -1,6 +1,6 @@
 from copy import deepcopy
 from functools import partial
-from typing import Callable, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Callable, Generic, List, Optional, Tuple, TypeVar, Union
 
 import rx
 from lenses import UnboundLens
