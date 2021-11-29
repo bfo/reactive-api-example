@@ -5,13 +5,11 @@ from functools import partial, wraps
 from operator import add
 from time import time
 
-import rx
 from fastapi import FastAPI
 from fastapi.params import Query
 from lenses import lens
 from rx import operators as op
 from rx.scheduler.eventloop import AsyncIOScheduler
-from rx.subject import Subject
 
 import effects
 
@@ -21,16 +19,17 @@ initial_state = {
 
 loop = asyncio.get_event_loop()
 scheduler = AsyncIOScheduler(loop)
-(api, on_request) = effects.fast_api(scheduler, loop)
-(state, focus, select) = effects.state(initial_state, scheduler=scheduler)
+api = effects.API(scheduler=scheduler, loop=loop)
+state = effects.State(initial_state, scheduler=scheduler)
 
 app = FastAPI()
+app.subscriptions = []
 
 
 @app.get("/plusone")
 async def root(id: int = Query(...)):
     before = time()
-    res = await on_request(IncreaseByOne(id=id))
+    res = await api.on_request(IncreaseByOne(id=id))
     after = time()
     print(f"request took {(after - before) * 1000000} us")
     return res
@@ -39,7 +38,7 @@ async def root(id: int = Query(...)):
 @app.get("/plustwo")
 async def root(id: int = Query(...)):
     before = time()
-    res = await on_request(IncreaseByTwo(id=id))
+    res = await api.on_request(IncreaseByTwo(id=id))
     after = time()
     print(f"request took {(after - before) * 1000000} us")
     return res
@@ -47,11 +46,8 @@ async def root(id: int = Query(...)):
 
 @app.get("/counter")
 async def get_counter(name: str = Query(...)):
-    res = await on_request(GetCounter(name=name))
+    res = await api.on_request(GetCounter(name=name))
     return res
-
-
-subscriptions = []
 
 
 def tagged(f):
@@ -97,63 +93,43 @@ class GetCounter:
     name: str
 
 
-def match(t, o):
-    return isinstance(o, t)
-
-
 @app.on_event("startup")
 def bind():
-    # Initial drivers setup
-    api_input_stream_proxy = Subject()
-    state_input_stream_proxy = Subject()
-    requests = api(api_input_stream_proxy)
-    state_changes = state(state_input_stream_proxy)
-
-    plusone_requests = requests.pipe(
-        op.filter(partial(match, IncreaseByOne)),
-    )
-    get_counter_requests = requests.pipe(
-        op.filter(partial(match, GetCounter)),
-    )
-    plusone_responses = plusone_requests.pipe(
+    api.requests.pipe(
+        api.select(IncreaseByOne),
         arrowmap(IncreaseByOne.do),
+        api.respond,
     )
-    plustwo_responses = requests.pipe(
-        op.filter(partial(match, IncreaseByTwo)),
+
+    api.requests.pipe(
+        api.select(IncreaseByTwo),
         arrowmap(IncreaseByTwo.do),
+        api.respond,
     )
 
     plusone_counter_lens = lens.GetItem("plusone_counter")
-
-    plusone_counter_increments = plusone_requests.pipe(
-        map_to((plusone_counter_lens, partial(add, 1))),
-    )
-
-    plusone_counter_value_stream = state_changes.pipe(
-        op.filter(select(plusone_counter_lens)),
-        op.map(focus),
+    counter_values = state.changes.pipe(
+        op.filter(effects.select(plusone_counter_lens)),
+        op.map(effects.focus),
         op.start_with(initial_state["plusone_counter"]),
     )
-    get_counter_responses = get_counter_requests.pipe(
-        op.with_latest_from(plusone_counter_value_stream),
-        op.do_action(lambda v: print(v)),
+    api.requests.pipe(
+        api.select(GetCounter),
+        op.with_latest_from(counter_values),
+        api.respond,
     )
 
-    # Form sinks
-    api_response_stream = rx.merge(
-        plusone_responses, plustwo_responses, get_counter_responses
+    api.requests.pipe(
+        api.select(IncreaseByOne),
+        map_to((plusone_counter_lens, partial(add, 1))),
+        state.apply,
     )
-    state_xform_stream = plusone_counter_increments
+
     # Bind all streams
-    subscriptions.append(
-        api_response_stream.subscribe(api_input_stream_proxy, scheduler=scheduler)
-    )
-    subscriptions.append(
-        state_xform_stream.subscribe(state_input_stream_proxy, scheduler=scheduler)
-    )
+    app.subscriptions = [api.run(), state.run()]
 
 
 @app.on_event("shutdown")
 def unbind():
-    for s in subscriptions:
+    for s in app.subscriptions:
         s.dispose()

@@ -1,9 +1,9 @@
 from typing import Any, Dict, Tuple
-from lenses.ui import UnboundLens
 
 import pytest
 import rx
 from lenses import lens
+from lenses.ui import UnboundLens
 from rx import operators
 from rx.core.typing import Observable as ObservableT
 from rx.scheduler.eventloop.asyncioscheduler import AsyncIOScheduler
@@ -17,7 +17,7 @@ async def test_creating_state_element_dynamically_class(event_loop):
     state = effects.State(dict(), scheduler=scheduler)
 
     state_xform_stream = rx.of((lens, lambda _: {"new": True}))
-    changes_stream = state.save(state_xform_stream)
+    changes_stream = state.apply(state_xform_stream)
 
     results = []
     result_stream = changes_stream.pipe(

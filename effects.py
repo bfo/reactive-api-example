@@ -1,10 +1,12 @@
 from copy import deepcopy
-from typing import Callable, Generic, List, Optional, Tuple, TypeVar, Union
+from functools import partial
+from typing import Callable, Generic, List, Optional, Tuple, Type, TypeVar, Union
 
 import rx
 from lenses import UnboundLens
 from rx import operators
-from rx.core.typing import Observable as ObservableT, Observer as ObserverT
+from rx.core.typing import Observable as ObservableT
+from rx.core.typing import Observer as ObserverT
 from rx.disposable.disposable import Disposable
 
 S = TypeVar("S")
@@ -58,12 +60,13 @@ class State(Generic[S, T, A, B]):
             self.__change_observer.on_next((lens, new_state))
         self.__state = new_state
 
-    def save(
+    def apply(
         self, commands: ObservableT[StateTransform[S, T, A, B]]
     ) -> ObservableT[StateChange[S, T, A, B]]:
         self.__command_streams.append(commands)
-        return self.changes()
+        return self.changes
 
+    @property
     def changes(self) -> ObservableT[StateChange[S, T, A, B]]:
         return self.__state_changes
 
@@ -113,6 +116,62 @@ def state(initial_state, *, scheduler):
         return rx.create(register_change_observer).pipe(operators.share())
 
     return (changes, focus, select)
+
+
+def match(t, o):
+    return isinstance(o, t)
+
+
+class API(Generic[S, T, A, B]):
+    def __init__(self, *, scheduler, loop) -> None:
+        self.__scheduler = scheduler
+        self.__loop = loop
+        self.__response_futures = dict()
+        self.__request_observer = None
+        self.__response_streams = []
+        self.__request_stream = rx.create(self.__register_observer).pipe(
+            operators.share()
+        )
+
+    def __deregister_observer(self):
+        self.__request_observer = None
+
+    def __register_observer(self, o, scheduler):
+        self.__request_observer = o
+        return Disposable(self.__deregister_observer)
+
+    def __return_response(self, req_rsp):
+        (request_object, response) = req_rsp
+        response_fut = self.__response_futures[id(request_object)]
+        response_fut.set_result(response)
+
+    async def on_request(self, request_object):
+        respose_fut = self.__loop.create_future()
+        self.__response_futures[id(request_object)] = respose_fut
+        if self.__request_observer:
+            self.__request_observer.on_next(request_object)
+        response = await respose_fut
+        del self.__response_futures[id(request_object)]
+        return response
+
+    def respond(self, req_rsp_pairs):
+        self.__response_streams.append(req_rsp_pairs)
+        return self.requests
+
+    @property
+    def requests(self):
+        return self.__request_stream
+
+    def run(self):
+        return rx.merge(*self.__response_streams).subscribe(
+            self.__return_response, scheduler=self.__scheduler
+        )
+
+    def select(self, type_):
+        def filter_by_type(requests):
+            return requests.pipe(operators.filter(partial(match, type_)))
+
+        return filter_by_type
 
 
 def fast_api(scheduler, loop):
