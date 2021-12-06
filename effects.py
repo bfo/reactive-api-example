@@ -1,209 +1,104 @@
+from contextvars import ContextVar
 from copy import deepcopy
 from functools import partial
-from typing import Callable, Generic, List, Optional, Tuple, TypeVar, Union
 
 import rx
-from lenses import UnboundLens
 from rx import operators
-from rx.core.typing import Observable as ObservableT
-from rx.core.typing import Observer as ObserverT
 from rx.disposable.disposable import Disposable
 
-S = TypeVar("S")
-T = TypeVar("T")
-A = TypeVar("A")
-B = TypeVar("B")
 
-StateTransform = Tuple[UnboundLens[S, T, A, B], Callable[[A], B]]
-StateChange = Tuple[UnboundLens[S, T, A, B], T]
+class Effect:
+    def __init__(self):
+        self.__source_observer = None
+        self.__sinks = []
+        self.source = operators.share()(rx.create(self.__set_source_observer))
+
+    def __unset_source_observer(self):
+        self.__source_observer = None
+
+    def __set_source_observer(self, obs, scheduler):
+        self.__source_observer = obs
+
+        return Disposable(self.__unset_source_observer)
+
+    def add_sink(self, stream):
+        self.__sinks.append(stream)
+
+    def source_emit(self, value):
+        if self.__source_observer is not None:
+            self.__source_observer.on_next(value)
+
+    def run(self, obs, *, scheduler):
+        return rx.merge(*self.__sinks).subscribe(obs, scheduler=scheduler)
 
 
-def focus(s: StateChange):
-    lens, state = s
-    return lens.get()(state)
-
-
-def select(lens_match: UnboundLens[S, T, A, B]):
-    def select_(s: StateChange[S, T, A, B]):
-        lens, _ = s
-        return lens is lens_match
-
-    return select_
-
-
-class State(Generic[S, T, A, B]):
-    def __init__(self, initial_state: S, *, scheduler) -> None:
-        self.__state: Union[S, T] = deepcopy(initial_state)
-        self.__change_observer: Optional[ObserverT[StateChange[S, T, A, B]]] = None
-        self.__state_changes: ObservableT[StateChange[S, T, A, B]] = rx.create(
-            self.__register_change_observer
-        ).pipe(operators.share())
-        self.__command_streams: List[ObservableT[StateTransform[S, T, A, B]]] = []
+class State:
+    def __init__(self, initial_state, *, scheduler) -> None:
+        self.__state = deepcopy(initial_state)
+        self.__initial_state = initial_state
         self.__scheduler = scheduler
+        self.__effect = Effect()
 
-    def __deregister_change_observer(self):
-        self.__change_observer = None
-
-    def __register_change_observer(
-        self, o: ObserverT[StateChange[S, T, A, B]], scheduler
-    ) -> Disposable:
-        self.__change_observer = o
-
-        return Disposable(self.__deregister_change_observer)
-
-    def __apply_change(self, cmd: StateChange[S, T, A, B]):
+    def __apply_change(self, cmd):
         lens, f = cmd
-
         new_state = lens.modify(f)(self.__state)
         # Note: __state reference never leaks outstide the state function
-        if self.__change_observer is not None:
-            self.__change_observer.on_next((lens, new_state))
+        self.__effect.source_emit(new_state)
         self.__state = new_state
+        print(f"New state is {new_state}")
 
-    def apply(
-        self, commands: ObservableT[StateTransform[S, T, A, B]]
-    ) -> ObservableT[StateChange[S, T, A, B]]:
-        self.__command_streams.append(commands)
-        return self.changes
+    def apply(self, commands):
+        self.__effect.add_sink(commands)
 
-    @property
-    def changes(self) -> ObservableT[StateChange[S, T, A, B]]:
-        return self.__state_changes
+    def watch(self, lens):
+        def only_watched(state_history):
+            prev_state, current_state = state_history
+            old_fragment = lens.get()(prev_state)
+            new_fragment = lens.get()(current_state)
+            if old_fragment != new_fragment:
+                return new_fragment
 
-    def run(self) -> Disposable:
-        return rx.merge(*self.__command_streams).subscribe(
-            self.__apply_change, scheduler=self.__scheduler
+        return self.__effect.source.pipe(
+            operators.pairwise(),
+            operators.map(only_watched),
+            operators.filter(lambda v: v is not None),
+            operators.start_with(lens.get()(self.__initial_state)),
+            operators.do_action(print),
         )
 
-
-def state(initial_state, *, scheduler):
-    change_observer = None
-    __state = deepcopy(initial_state)
-
-    def deregister_change_observer():
-        nonlocal change_observer
-        change_observer = None
-
-    def register_change_observer(observer, scheduler):
-        nonlocal change_observer
-        change_observer = observer
-
-        return Disposable(deregister_change_observer)
-
-    def run(cmd: StateChange):
-        lens, f = cmd
-        nonlocal __state
-
-        new_state = lens.modify(f)(__state)
-        # Note: __state reference never leaks outstide the state function
-        if change_observer is not None:
-            change_observer.on_next((lens, new_state))
-        __state = new_state
-
-    def focus(s: StateChange):
-        lens, state = s
-        return lens.get()(state)
-
-    def select(lens_match: UnboundLens[S, T, A, B]):
-        def select_(s: StateChange):
-            lens, _ = s
-            return lens is lens_match
-
-        return select_
-
-    def changes(xforms: ObservableT[StateChange]) -> ObservableT[StateChange]:
-        xforms.subscribe(run, scheduler=scheduler)
-        return rx.create(register_change_observer).pipe(operators.share())
-
-    return (changes, focus, select)
+    def run(self) -> Disposable:
+        return self.__effect.run(self.__apply_change, scheduler=self.__scheduler)
 
 
 def match(t, o):
     return isinstance(o, t)
 
 
-class API(Generic[S, T, A, B]):
+class API:
+    __response_future = ContextVar("response_future")
+
     def __init__(self, *, scheduler, loop) -> None:
         self.__scheduler = scheduler
         self.__loop = loop
-        self.__response_futures = dict()
-        self.__request_observer = None
-        self.__response_streams = []
-        self.__request_stream = rx.create(self.__register_observer).pipe(
-            operators.share()
-        )
+        self.__effect = Effect()
 
-    def __deregister_observer(self):
-        self.__request_observer = None
-
-    def __register_observer(self, o, scheduler):
-        self.__request_observer = o
-        return Disposable(self.__deregister_observer)
-
-    def __return_response(self, req_rsp):
-        (request_object, response) = req_rsp
-        response_fut = self.__response_futures[id(request_object)]
+    def __return_response(self, response):
+        response_fut = self.__response_future.get()
         response_fut.set_result(response)
 
     async def on_request(self, request_object):
-        respose_fut = self.__loop.create_future()
-        self.__response_futures[id(request_object)] = respose_fut
-        if self.__request_observer:
-            self.__request_observer.on_next(request_object)
-        response = await respose_fut
-        del self.__response_futures[id(request_object)]
+        response_fut = self.__loop.create_future()
+        token = self.__response_future.set(response_fut)
+        self.__effect.source_emit(request_object)
+        response = await response_fut
+        self.__response_future.reset(token)
         return response
 
-    def respond(self, req_rsp_pairs):
-        self.__response_streams.append(req_rsp_pairs)
-        return self.requests
+    def respond(self, responses_stream):
+        self.__effect.add_sink(responses_stream)
 
-    @property
-    def requests(self):
-        return self.__request_stream
+    def requests(self, type_):
+        return self.__effect.source.pipe(operators.filter(partial(match, type_)))
 
     def run(self):
-        return rx.merge(*self.__response_streams).subscribe(
-            self.__return_response, scheduler=self.__scheduler
-        )
-
-    def select(self, type_):
-        def filter_by_type(requests):
-            return requests.pipe(operators.filter(partial(match, type_)))
-
-        return filter_by_type
-
-
-def fast_api(scheduler, loop):
-    responses = {}
-    request_observer = None
-
-    async def on_request(request_object):
-        respose_fut = loop.create_future()
-        responses[id(request_object)] = respose_fut
-        if request_observer:
-            request_observer.on_next(request_object)
-        response = await respose_fut
-        del responses[id(request_object)]
-        return response
-
-    def unsubscribe():
-        nonlocal request_observer
-        request_observer = None
-
-    def on_request_subscribe(observer, scheduler):
-        nonlocal request_observer
-        request_observer = observer
-
-        return Disposable(unsubscribe)
-
-    def on_incoming_response(item):
-        (request_object, response) = item
-        response_fut = responses[id(request_object)]
-        response_fut.set_result(response)
-
-    def produce_output(inputs):
-        inputs.subscribe(on_incoming_response, scheduler=scheduler)
-        return rx.create(on_request_subscribe).pipe(operators.share())
-
-    return (produce_output, on_request)
+        return self.__effect.run(self.__return_response, scheduler=self.__scheduler)

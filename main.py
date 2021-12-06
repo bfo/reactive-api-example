@@ -1,7 +1,7 @@
 #!env python
 import asyncio
 from dataclasses import dataclass
-from functools import partial, wraps
+from functools import partial
 from operator import add
 from time import time
 
@@ -16,8 +16,14 @@ import effects
 initial_state = {
     "counters": {
         "plusone": 0,
+        "plustwo": 0,
     },
 }
+
+lenses = {}
+lenses["counters"] = lens.GetItem("counters")
+lenses["plusone"] = lenses["counters"].GetItem("plusone")
+lenses["plustwo"] = lenses["counters"].GetItem("plustwo")
 
 loop = asyncio.get_event_loop()
 scheduler = AsyncIOScheduler(loop)
@@ -29,7 +35,7 @@ app.subscriptions = []
 
 
 @app.get("/plusone")
-async def root(id: int = Query(...)):
+async def plusone(id: int = Query(...)):
     before = time()
     res = await api.on_request(IncreaseByOne(id=id))
     after = time()
@@ -38,7 +44,7 @@ async def root(id: int = Query(...)):
 
 
 @app.get("/plustwo")
-async def root(id: int = Query(...)):
+async def plustwo(id: int = Query(...)):
     before = time()
     res = await api.on_request(IncreaseByTwo(id=id))
     after = time()
@@ -52,26 +58,11 @@ async def get_counter(name: str = Query(...)):
     return res
 
 
-def tagged(f):
-    @wraps(f)
-    def _(arg):
-        return (arg, f(arg))
-
-    return _
-
-
-def arrowmap(f):
-    def _(input):
-        return input.pipe(op.map(tagged(f)))
-
-    return _
-
-
 def map_to(item):
-    def _(input):
+    def operator(input):
         return input.pipe(op.map(lambda *args, **kwargs: item))
 
-    return _
+    return operator
 
 
 @dataclass
@@ -94,36 +85,36 @@ class IncreaseByTwo:
 class GetCounter:
     name: str
 
+    def pluck(self, state):
+        try:
+            return state[self.name]
+        except KeyError:
+            return {"error": "counter not found"}
+
+
 
 @app.on_event("startup")
 def bind():
-    api.requests.pipe(
-        api.select(IncreaseByOne),
-        arrowmap(IncreaseByOne.do),
+    api.requests(IncreaseByOne).pipe(
+        op.map(IncreaseByOne.do),
         api.respond,
     )
 
-    api.requests.pipe(
-        api.select(IncreaseByTwo),
-        arrowmap(IncreaseByTwo.do),
+    api.requests(IncreaseByTwo).pipe(
+        op.map(IncreaseByTwo.do),
         api.respond,
     )
 
-    plusone_counter_lens = lens.GetItem("counters").GetItem("plusone")
-    counter_values = state.changes.pipe(
-        op.filter(effects.select(plusone_counter_lens)),
-        op.map(effects.focus),
-        op.start_with(0),
-    )
-    api.requests.pipe(
-        api.select(GetCounter),
-        op.with_latest_from(counter_values),
+    counters_values = state.watch(lenses["counters"])
+
+    api.requests(GetCounter).pipe(
+        op.with_latest_from(counters_values),
+        op.starmap(GetCounter.pluck),
         api.respond,
     )
 
-    api.requests.pipe(
-        api.select(IncreaseByOne),
-        map_to((plusone_counter_lens, partial(add, 1))),
+    api.requests(IncreaseByOne).pipe(
+        map_to((lenses["plusone"], partial(add, 1))),
         state.apply,
     )
 
