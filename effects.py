@@ -59,6 +59,7 @@ class State:
                 return new_fragment
 
         return self.__effect.source.pipe(
+            operators.start_with(self.__state),
             operators.pairwise(),
             operators.map(only_watched),
             operators.filter(lambda v: v is not None),
